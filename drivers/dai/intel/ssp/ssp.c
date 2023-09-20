@@ -17,6 +17,7 @@
 LOG_MODULE_REGISTER(LOG_DOMAIN);
 
 #include "ssp.h"
+#include <ssp_regs.h>
 
 #define DT_DRV_COMPAT intel_ssp_dai
 
@@ -2212,13 +2213,10 @@ static int ssp_init(const struct device *dev)
 	return pm_device_runtime_enable(dev);
 }
 
-static struct dai_driver_api dai_intel_ssp_api_funcs = {
-	.probe			= pm_device_runtime_get,
-	.remove			= pm_device_runtime_put,
-	.config_set		= dai_ssp_config_set,
-	.config_get		= dai_ssp_config_get,
-	.trigger		= dai_ssp_trigger,
-	.get_properties		= dai_ssp_get_properties,
+static uint32_t ssp_freq_sources[] = {
+	DAI_INTEL_SSP_CLOCK_AUDIO_CARDINAL,
+	DAI_INTEL_SSP_CLOCK_XTAL_OSCILLATOR,
+	DAI_INTEL_SSP_CLOCK_PLL_FIXED,
 };
 
 static struct dai_intel_ssp_freq_table ssp_freq_table[] = {
@@ -2230,10 +2228,100 @@ static struct dai_intel_ssp_freq_table ssp_freq_table[] = {
 	  DT_PROP(DT_NODELABEL(pllclk), clock_frequency) / 1000},
 };
 
-static uint32_t ssp_freq_sources[] = {
-	DAI_INTEL_SSP_CLOCK_AUDIO_CARDINAL,
-	DAI_INTEL_SSP_CLOCK_XTAL_OSCILLATOR,
-	DAI_INTEL_SSP_CLOCK_PLL_FIXED,
+static uint32_t ssp_ts_local_tsctrl_addr(int index)
+{
+	return TIMESTAMP_BASE + TS_I2S_LOCAL_TSCTRL(index);
+}
+
+static uint32_t ssp_ts_local_sample_addr(int index)
+{
+	return TIMESTAMP_BASE + TS_I2S_LOCAL_SAMPLE(index);
+}
+
+static uint32_t ssp_ts_local_walclk_addr(int index)
+{
+	return TIMESTAMP_BASE + TS_I2S_LOCAL_WALCLK(index);
+}
+
+static int dai_ssp_timestamp_config(const struct device *dev, struct dai_ts_cfg *cfg)
+{
+	int i;
+
+	cfg->walclk_rate = 0;
+	for (i = 0; i < NUM_SSP_FREQ; i++) {
+		if (ssp_freq_sources[i] == DAI_INTEL_SSP_CLOCK_XTAL_OSCILLATOR)
+			cfg->walclk_rate = ssp_freq_table[i].freq;
+	}
+
+	return 0;
+}
+
+static int dai_timestamp_ssp_start(const struct device *dev, struct dai_ts_cfg *cfg)
+{
+	uint32_t addr = ssp_ts_local_tsctrl_addr(cfg->index);
+	uint32_t cdmas;
+
+	/* Set DMIC timestamp registers */
+
+	/* First point CDMAS to GPDMA channel that is used by DMIC
+	 * also clear NTK to be sure there is no old timestamp.
+	 */
+	cdmas = FIELD_PREP(TS_LOCAL_TSCTRL_CDMAS, cfg->dma_chan_index +
+		cfg->dma_chan_count * cfg->dma_id);
+	sys_write32(TS_LOCAL_TSCTRL_NTK | cdmas, addr);
+
+	/* Request on demand timestamp */
+	sys_write32(TS_LOCAL_TSCTRL_ODTS | cdmas, addr);
+
+	return 0;
+}
+
+static int dai_timestamp_ssp_stop(const struct device *dev, struct dai_ts_cfg *cfg)
+{
+	/* Clear NTK and write zero to CDMAS */
+	sys_write32(TS_LOCAL_TSCTRL_NTK, ssp_ts_local_tsctrl_addr(cfg->index));
+	return 0;
+}
+
+static int dai_timestamp_ssp_get(const struct device *dev, struct dai_ts_cfg *cfg,
+				  struct dai_ts_data *tsd)
+{
+	/* Read DMIC timestamp registers */
+	uint32_t tsctrl = ssp_ts_local_tsctrl_addr(cfg->index);
+	uint32_t ntk;
+
+	/* Read SSP timestamp registers */
+	ntk = sys_read32(tsctrl) & TS_LOCAL_TSCTRL_NTK;
+	if (!ntk)
+		goto out;
+
+	/* NTK was set, get wall clock */
+	tsd->walclk = sys_read64(ssp_ts_local_walclk_addr(cfg->index));
+
+	/* Sample */
+	tsd->sample = sys_read64(ssp_ts_local_sample_addr(cfg->index));
+
+	/* Clear NTK to enable successive timestamps */
+	sys_write32(TS_LOCAL_TSCTRL_NTK, tsctrl);
+
+out:
+	tsd->walclk_rate = cfg->walclk_rate;
+	if (!ntk)
+		return -ENODATA;
+
+	return 0;
+}
+static struct dai_driver_api dai_intel_ssp_api_funcs = {
+	.probe			= pm_device_runtime_get,
+	.remove			= pm_device_runtime_put,
+	.config_set		= dai_ssp_config_set,
+	.config_get		= dai_ssp_config_get,
+	.trigger		= dai_ssp_trigger,
+	.get_properties		= dai_ssp_get_properties,
+	.ts_config		= dai_ssp_timestamp_config,
+	.ts_start		= dai_timestamp_ssp_start,
+	.ts_stop		= dai_timestamp_ssp_stop,
+	.ts_get			= dai_timestamp_ssp_get
 };
 
 static struct dai_intel_ssp_mn ssp_mn_divider = {
